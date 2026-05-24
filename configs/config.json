@@ -1,0 +1,16 @@
+{
+    "repeat_time":              5,
+    "model": {
+        "fil_num":              20,
+        "drop_rate":            0.3,
+        "batch_size":           2,
+        "balanced":             0,
+        "Data_dir":             "C:/Users/User/Desktop/demo/no_bet",
+        "learning_rate":        0.0001,
+        "train_epochs":         100,
+        "checkpoint_dir":       "C:/Users/User/Desktop/0303/checkpoint_dir/"
+    }
+}
+
+
+
