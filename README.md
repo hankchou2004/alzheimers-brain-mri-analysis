@@ -224,3 +224,230 @@ python inference_demo.py
 ## 授權
 
 本專案僅供學術與研究使用，詳見 `LICENSE`。
+
+# Alzheimer's Brain MRI Analysis
+
+Deep learning-based Alzheimer's disease detection using 3D brain MRI images, featuring automated preprocessing, model training, Grad-CAM visualization, and an interactive inference GUI.
+
+---
+
+## Overview
+
+This project implements a full pipeline for Alzheimer's disease (AD) classification from structural MRI scans using the [ADNI](https://adni.loni.usc.edu/) dataset. The backbone is a pretrained **3D ResNet-18** fine-tuned for binary classification (CN vs. AD / MCI), with multi-layer **Grad-CAM** heatmaps for interpretability.
+
+**Key references:**
+- Preprocessing pipeline and project structure partially adapted from [vkola-lab/brain2020](https://github.com/vkola-lab/brain2020) (MIT License).
+- 3D ResNet-18 model architecture referenced from: *Learning-Based Progression Detection of Alzheimer's Disease Using 3D MRI Images*, International Journal of Intelligent Systems, 2025. [https://doi.org/10.1155/int/3981977](https://doi.org/10.1155/int/3981977)
+
+---
+
+## Project Structure
+
+```
+.
+├── configs/
+│   └── config.json              # Training hyperparameters and paths
+├── data/
+│   └── dataloader.py            # Dataset class with 3D augmentation
+├── models/
+│   ├── model.py                 # CNN and ResNet18_3D architectures
+│   └── model_wrapper.py         # Training / evaluation wrapper
+├── utils/
+│   ├── utils.py                 # CSV reading, metrics, K-Fold split
+│   └── plot.py                  # Loss/accuracy curves and confusion matrix
+├── Preprocess/
+│   ├── __init__.py
+│   ├── registration.py          # FSL FLIRT registration (via WSL)
+│   ├── registration.sh          # Shell script for full registration pipeline
+│   ├── registration0427.py      # Extended registration with mode selection
+│   ├── registration0427.sh      # Shell script supporting full / no_bet / no_reg modes
+│   ├── intensity_normalization_and_clip.py  # Z-score normalization + clip to [-1, 2.5]
+│   ├── back_remove.py           # Flood-fill background removal
+│   └── brain_region.npy         # Brain mask for background removal
+├── lookupcsv/
+│   ├── ADNI.csv                 # Full subject metadata
+│   └── exp{N}/                  # train / valid / test splits per experiment
+│       ├── train.csv
+│       ├── valid.csv
+│       └── test.csv
+├── main.py                      # Training entry point
+├── main_gradcam.py              # Batch Grad-CAM generation
+├── preprocess.py                # CLI preprocessing tool
+├── inference_demo.py            # Interactive GUI (NeuroScan AI)
+├── gradcam_triptych.py          # Interactive multi-subject Grad-CAM viewer
+├── gradcam_to_png.py            # Export middle-slice heatmaps to PNG
+└── convert_to_nii.bat           # DICOM → NIfTI batch conversion (Windows)
+```
+
+---
+
+## Requirements
+
+- Python ≥ 3.10
+- PyTorch ≥ 2.0 with CUDA
+- FSL (for MRI registration, installed inside WSL on Windows)
+- Key Python packages:
+
+```bash
+pip install torch torchvision nibabel numpy scipy matplotlib seaborn \
+            scikit-learn tqdm pandas customtkinter
+```
+
+---
+
+## Data Preparation
+
+### Step 1 — Convert DICOM to NIfTI (Windows)
+
+Edit paths in `convert_to_nii.bat`, then run it to batch-convert DICOM files using `dcm2niix`.
+
+### Step 2 — Preprocess NIfTI files
+
+`preprocess.py` is a standalone CLI tool that runs the full preprocessing pipeline:
+
+```bash
+# Process a single file
+python preprocess.py --input path/to/scan.nii --output path/to/output/
+
+# Process an entire folder (recursive)
+python preprocess.py --input path/to/nii_folder/ --output path/to/output/
+```
+
+The pipeline runs three stages in sequence:
+
+1. **Registration** — FSL FLIRT linear registration to MNI152 1mm space (via WSL on Windows). Three modes are available via `registration0427.py`:
+   - `full` — reorient → robustfov → BET skull stripping → FLIRT MNI registration
+   - `no_bet` — reorient → robustfov → FLIRT MNI registration (skip skull stripping)
+   - `no_reg` — reorient → robustfov → BET skull stripping only (no registration)
+2. **Intensity normalization** — Z-score normalization followed by clipping to `[-1, 2.5]`, output shape `(181, 217, 181)`.
+3. **Background removal** — Flood-fill from volume corners to set non-brain voxels to `-1`, guided by `brain_region.npy`.
+
+### Step 3 — Generate data splits
+
+Edit `config.json` and run `data_split()` inside `main.py` (uncomment the call) to generate stratified K-Fold `train/valid/test` CSV splits under `lookupcsv/exp{N}/`.
+
+---
+
+## Training
+
+Edit `configs/config.json`:
+
+```json
+{
+    "repeat_time": 5,
+    "model": {
+        "fil_num": 20,
+        "drop_rate": 0.3,
+        "batch_size": 2,
+        "balanced": 0,
+        "Data_dir": "path/to/preprocessed/",
+        "learning_rate": 0.0001,
+        "train_epochs": 100,
+        "checkpoint_dir": "path/to/checkpoints/"
+    }
+}
+```
+
+Then run:
+
+```bash
+python main.py
+```
+
+This will, for each experiment index:
+1. Load pretrained weights if found at the expected checkpoint path.
+2. Train the model using **Adam** optimizer with **ReduceLROnPlateau** scheduling and mixed-precision (AMP).
+3. Save the best model by validation accuracy (`best_metric`) and by validation loss (`best_loss`).
+4. Evaluate both saved models on train/valid/test sets and export results to CSV.
+5. Generate loss/accuracy curves and confusion matrices as PNG files.
+
+---
+
+## Model Architecture
+
+### ResNet18_3D
+
+The primary model is based on `torchvision.models.video.r3d_18` (Kinetics pretrained), adapted for single-channel 3D MRI:
+
+- **Input layer** modified from 3-channel RGB to 1-channel grayscale: `Conv3d(1, 64, kernel=(3,7,7), stride=(1,2,2))`.
+- **Classification head** replaced with `Dropout → Linear(512, 2)`.
+- **Forward pass** exposes intermediate feature maps (`layer2`, `layer3`, `layer4`) for Grad-CAM.
+
+### CNN (baseline)
+
+A lightweight custom 3D CNN with four `ConvLayer` blocks (Conv3d → BatchNorm → LeakyReLU → MaxPool3d → Dropout) followed by two dense layers.
+
+---
+
+## Grad-CAM Visualization
+
+### Batch generation
+
+```bash
+python main_gradcam.py
+```
+
+Generates per-subject folders under `ResNet18_3D.gradcam_multi_layer/` containing:
+- `raw_mri.npy` — preprocessed MRI volume
+- `heatmap_layer2.npy`, `heatmap_layer3.npy`, `heatmap_layer4.npy` — Grad-CAM activation maps
+- `info.json` — prediction, confidence, and per-layer gradient importance
+
+### Interactive viewer
+
+```bash
+python gradcam_triptych.py
+```
+
+Opens a Matplotlib GUI with axial/coronal/sagittal views, a layer selector (layer2/3/4), heatmap toggle, and subject navigation via arrow keys.
+
+### Export to PNG
+
+Edit paths in `gradcam_to_png.py` and run it to save middle-slice heatmaps and the raw MRI slice as PNG images.
+
+---
+
+## Interactive Inference GUI
+
+```bash
+python inference_demo.py
+```
+
+Launches **NeuroScan AI**, a dark-themed desktop application (CustomTkinter) that supports:
+
+- Loading a trained `.pth` weight file
+- Selecting a single NIfTI file or a batch folder
+- Optionally loading an ADNI CSV for subject metadata lookup
+- Running the full preprocessing pipeline and Grad-CAM inference in a background thread
+- Displaying axial/coronal/sagittal views with adjustable heatmap overlay (opacity, threshold)
+- Switching between layer2/3/4 activation maps
+- Showing prediction, confidence score, and per-layer gradient importance bars
+
+---
+
+## Outputs
+
+| File | Description |
+|------|-------------|
+| `{model}_best_metric_{epoch}.pth` | Weights at highest validation accuracy |
+| `{model}_best_loss_{epoch}.pth` | Weights at lowest validation loss |
+| `{model}_training_log.csv` | Epoch-level train/valid loss, accuracy, LR |
+| `{model}_test_best_metric.csv` | Test metrics for best-metric model |
+| `{model}_test_best_loss.csv` | Test metrics for best-loss model |
+| `{model}_exp{N}_loss_curve.png` | Training loss curves |
+| `{model}_exp{N}_accuracy_curve.png` | Training accuracy curves |
+| `{model}_exp{N}_{task}_{type}_cm.png` | Confusion matrix with metrics |
+
+---
+
+## Acknowledgements
+
+- MRI preprocessing pipeline structure adapted from [vkola-lab/brain2020](https://github.com/vkola-lab/brain2020) (Kolachalama Laboratory, MIT License).
+- 3D ResNet-18 architecture design informed by: Henry Horng-Shing Lu et al., *Learning-Based Progression Detection of Alzheimer's Disease Using 3D MRI Images*, International Journal of Intelligent Systems, 2025. [https://doi.org/10.1155/int/3981977](https://doi.org/10.1155/int/3981977)
+- MRI data from the [Alzheimer's Disease Neuroimaging Initiative (ADNI)](https://adni.loni.usc.edu/).
+- Registration performed using [FSL FLIRT](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FLIRT).
+
+---
+
+## License
+
+This project is for academic and research use. See `LICENSE` for details.
